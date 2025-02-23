@@ -12,6 +12,7 @@
 #include "hardware/sync.h"
 #include "ssd1306/ssd1306.h"
 #include "neopixel.c"
+#include "bitmap.h"
 
 #define MICROPHONE_PIN          28
 #define MICROPHONE_CHANNEL      2
@@ -23,6 +24,7 @@
 #define DEBOUNCE_DELAY_MS       50
 
 // Parâmetros e macros do ADC.
+#define ADC_CLK_REF             48000000
 #define ADC_CLOCK_DIV           12000.f //48M/(12000) = 4kSps
 #define SAMPLES                 4096   // Número de amostras que serão feitas do ADC.
 #define ADC_ADJUST(x)           (x * 3.3f / (1 << 12u) - 1.65f) // Ajuste do valor do ADC para Volts.
@@ -35,15 +37,17 @@
 #define FREQ_B3                 246.94
 #define FREQ_E4                 329.63
 
-#define FREQ_RESOLUTION         (float)(4000.0/4096.0)
+#define FREQ_RESOLUTION         (float)((ADC_CLK_REF/ADC_CLOCK_DIV)/SAMPLES)
 #define PI                      3.14159265358979323846
 #define NUM_OF_STRINGS          6
 #define DELTA_FREQ_FOR_TUNNING  0.1225 // Desvio relativo entre um tom, e os tons abaixo ou acima
 #define MAX_DEV_TO_BE_TUNED     0.5 // Margem para considerar afinado: 0,5 Hz abaixo ou acima
+#define REST_TIME               20000
 
 
 // Enum para os estados da máquina
 typedef enum {
+    WELCOME,
     IDLE,
     DETECTING,
     TUNING,
@@ -85,17 +89,17 @@ dma_channel_config dma_cfg;
 // Buffer de amostras do ADC.
 uint16_t adc_buffer[SAMPLES];
 complex_t fft_data[SAMPLES];
-void sample_mic();
-void fft_pre_calc(uint16_t*, int, complex_t*);
-void hann_window(complex_t*, int);
-void fft(complex_t*, int);
-float magnitude(complex_t);
-float find_peak(complex_t*, int);
+void adc_sample_mic();
+void dsp_fft_pre_calc(uint16_t*, int, complex_t*);
+void dsp_hann_window(complex_t*, int);
+void dsp_fft(complex_t*, int);
+float dsp_magnitude(complex_t);
+float dsp_find_peak(complex_t*, int, float);
 bool check_note(float);
 
 
 uint8_t oled[ssd1306_buffer_length];
-void print_on_oled(uint8_t*, char**, int, int, int);
+void print_on_oled(uint8_t *, char[][16], int, int, int);
 
 void oled_config(){
      // Inicialização do i2c
@@ -141,13 +145,16 @@ void adc_dma_config(){
 }
 
 void set_LED_matrix(int);
-
 volatile bool button_pressed = false;
+volatile bool timer_expired = false;
+volatile state current_state = WELCOME;
+bool timer_started = false;
+alarm_id_t detecting_alarm = 0;
 static void gpio_callback(uint gpio, uint32_t events);
-
+static int64_t timer_callback(alarm_id_t id, void *user_data);
 char *note_labels[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
 
-string_t strings[6] = {
+string_t strings[NUM_OF_STRINGS] = {
     {E2, FREQ_E2}, // E2
     {A2, FREQ_A2}, // A2
     {D3, FREQ_D3}, // D3
@@ -158,150 +165,113 @@ string_t strings[6] = {
 
 string_t current_string = {UNKNOWN, 0.0f};
 
-static const unsigned char image_bitmap[] = {
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0xff,0xff,0xff,0x7f,0x00,0xff,0xff,
-    0xff,0xff,0xff,0xff,0x3f,0x21,0xfe,0xff,0xff,0xff,0xff,0xff,0x1f,0x08,0xfe,
-    0xff,0xff,0xff,0xff,0xff,0x0f,0x02,0xf8,0xff,0xff,0xff,0xff,0xff,0x4f,0x60,
-    0xfc,0xff,0xff,0xff,0xff,0xff,0x07,0xf8,0xf1,0xff,0xff,0xff,0xff,0xff,0x23,
-    0xfe,0xf9,0xff,0xff,0xff,0xff,0xff,0x0b,0xfe,0xf3,0xff,0xff,0xff,0xff,0xff,
-    0x81,0xff,0xe7,0xef,0xff,0xff,0xff,0xff,0x01,0xdf,0xe7,0x87,0xff,0xff,0xff,
-    0xff,0xc8,0x87,0xef,0x87,0xff,0xff,0xff,0xff,0xc0,0x83,0xef,0x03,0xff,0xff,
-    0xff,0x7e,0xc2,0x11,0xcf,0x23,0xff,0xff,0x0f,0x40,0xf0,0x05,0xef,0x03,0xfe,
-    0xff,0x07,0x00,0xe0,0xc1,0xdf,0x13,0xff,0xff,0x81,0x02,0xf1,0xe0,0xcf,0x03,
-    0xfe,0xff,0xe1,0x3f,0x80,0xf0,0xdf,0x43,0xfe,0xff,0xe8,0x3f,0x04,0xf0,0xdf,
-    0x87,0xfe,0xff,0xf0,0x1f,0x01,0xf2,0xcf,0x47,0xfe,0x7f,0xf8,0x1f,0x94,0xc0,
-    0xdf,0xcf,0xfe,0x7f,0xf8,0x0f,0x3e,0x00,0xdf,0x7f,0xfe,0x7f,0xfa,0x07,0x7f,
-    0x04,0xcc,0xff,0xfe,0x7f,0xf8,0x47,0x7f,0x48,0xc0,0x7f,0xfe,0x7f,0xfc,0x83,
-    0x7f,0x31,0xc0,0x7f,0xfe,0x7f,0xf8,0x91,0x7f,0xf8,0xc9,0x3f,0xff,0x7f,0xf8,
-    0xc0,0x7f,0xf0,0x07,0x1f,0xff,0x7f,0x22,0xe4,0x7f,0xf2,0x0f,0x80,0xff,0xff,
-    0x00,0xf0,0xff,0xf0,0x27,0x80,0xff,0xff,0x00,0xf9,0x7f,0xe0,0xe3,0xd1,0xff,
-    0xff,0x11,0xfc,0xff,0x80,0xe0,0xef,0xff,0xff,0x43,0xff,0xff,0x08,0xf2,0xff,
-    0xff,0xff,0xff,0xff,0xff,0x80,0xe0,0xff,0xff,0xff,0xff,0xff,0xff,0x04,0xf0,
-    0xff,0xff,0xff,0xff,0xff,0xff,0x21,0xf8,0xff,0xff,0xff,0xff,0xff,0xff,0x03,
-    0xf9,0xff,0xff,0xff,0xff,0xff,0xff,0x03,0xfc,0xff,0xff,0xff,0xff,0xff,0xff,
-    0x4f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xbf,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
-    0xff,0xff,0xff,0xff
-};
-
-char message[8][16] = {NULL};
+char message[8][16] = {0};
 float detected_freq = 0.0;
 float dev_freq; 
 
 int main() {
+    
+    int led_index;
+    bool up_down = true;
     stdio_init_all();
     
     /*
     //Configuração para uso de bitmap
         ssd1306_t ssd_bm;
-        ssd1306_init_bm(&ssd_bm, 128, 64, false, 0x3C, i2c1);
+        ssd1306_init_bm(&ssd_bm, BITMAP_WIDTH, BITMAP_HEIGHT, false, 0x3C, i2c1);
         ssd1306_config(&ssd_bm);
     */ 
 
     adc_dma_config();
+    
     npInit(NPLED_PIN, NPLED_COUNT);
+    for(int i = 0; i < NPLED_COUNT; i++){
+        npSetLED(i, 0, 0, 0);
+    }
+    npWrite();
 
     gpio_init(BTN_A_PIN);
     gpio_set_dir(BTN_A_PIN, GPIO_IN);
     gpio_pull_up(BTN_A_PIN);
 
-    state current_state = IDLE;
-    int i = -2;
-    bool up_down = 1;
+    gpio_set_irq_enabled_with_callback(BTN_A_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
    
-    //ssd1306_draw_bitmap(&ssd_bm, image_bitmap);
-    //sleep_ms(3000);
-
+    /*
+    memcpy(oled, image_bitmap, sizeof(image_bitmap));
+    render_on_display(oled, &frame_area);
+    sleep_ms(3000);  // exibe o bitmap por 3 segundos
+    */
+    
+    /*
+    ssd1306_draw_bitmap(&ssd_bm, image_bitmap);
+    sleep_ms(3000);
+    
+    */
     oled_config();
 
     memset(oled, 0, ssd1306_buffer_length);
     render_on_display(oled, &frame_area);
 
+    sleep_ms(100);
+
     while (1) {
         if (up_down) {
-            i = (i + 1) % 25;
-            up_down = i == 24 ? false : true;
+            led_index= (led_index + 1) % 25;
+            up_down = led_index == 24 ? false : true;
         } else {
-            i = (i - 1) % 25;
-            up_down = i == 0 ? true : false;
+            led_index = (led_index - 1) % 25;
+            up_down = led_index == 0 ? true : false;
         }
         npClear();
+        printf("%d\n", current_state);
         switch (current_state) {
-            case IDLE:
+            case WELCOME:
                 memset(message, 0, sizeof(message));
-                    message[0] = "  Embarcatech   ";
-                    message[1] = "                ";
-                    message[2] = "    Afinador    ";
-                    message[3] = "    Digital     ";
+                    strncpy(message[0], "  Embarcatech  ", 16);
+                    strncpy(message[1], "               ", 16);
+                    strncpy(message[2], "    Afinador   ", 16);
+                    strncpy(message[3], "    Digital    ", 16);
+                   
                 print_on_oled(oled, message, 4, 5, 0);
                 sleep_ms(2000);
                 current_state = DETECTING;
+                led_index = - 1;
                 break;
 
             case DETECTING:
+                if(!timer_started){
+                    detecting_alarm = add_alarm_in_ms(REST_TIME, timer_callback, NULL, false);
+                    timer_started = true;
+                }
                 memset(message, 0, sizeof(message));
-                message[0] = "    Captando   ";
-                message[1] = "    o som da   ";
-                message[2] = "    guitarra   ";
-                              
-                print_on_oled(oled, message, 4, 6, 8);
+                strncpy(message[0], "   Captando    ", 16);
+                strncpy(message[1], "   o som da    ", 16);
+                strncpy(message[2], "   guitarra    ", 16);
+                                            
+                print_on_oled(oled, message, 3, 6, 16);
                 
-                npSetLED(i,0, 0, 128);
+                npSetLED(led_index,0, 0, 128);
                 npWrite();
                 
-                sample_mic();
-                fft_pre_calc(adc_buffer, SAMPLES, fft_data);
-                hann_window(fft_data, SAMPLES);
-                fft(fft_data, SAMPLES);
-                detected_freq = find_peak(fft_data, SAMPLES);
-                printf("%f\n", detected_freq);
-                current_state = check_note(detected_freq) ? TUNING : DETECTING;
+                adc_sample_mic();
+                dsp_fft_pre_calc(adc_buffer, SAMPLES, fft_data);
+                dsp_hann_window(fft_data, SAMPLES);
+                dsp_fft(fft_data, SAMPLES);
+                detected_freq = dsp_find_peak(fft_data, SAMPLES, FREQ_RESOLUTION);
+
+                if(timer_expired){
+                    current_state = IDLE;
+                    timer_expired = false;
+                    break;
+                }
+
+                if(check_note(detected_freq)) {
+                   cancel_alarm(detecting_alarm);
+                   timer_started = false;
+                   current_state = TUNING;
+                } else {
+                    current_state = DETECTING;
+                }
                 break;
 
             case TUNING:
@@ -325,68 +295,87 @@ int main() {
                 break;
             case LOW:
                 memset(message, 0, sizeof(message));
-                strcpy(message[0], "    Nota:   ");
-                strcat(message[0], note_labels[current_string.note]);
-                message[1] = "               ";
-                message[2] = "    Aperte a   ";
-                message[3] = "     corda     ";
+                strncpy(message[0], "    Nota: ", 12);
+                strncat(message[0] ,note_labels[current_string.note], 2);
+                strncpy(message[1], "              ", 16);
+                strncpy(message[2], "   Aperte a  ", 16);
+                strncpy(message[3], "     corda    ", 16);
                 print_on_oled(oled, message, 4, 6, 8);
 
-                sample_mic();
-                fft_pre_calc(adc_buffer, SAMPLES, fft_data);
-                hann_window(fft_data, SAMPLES);
-                fft(fft_data, SAMPLES);
-                detected_freq = find_peak(fft_data, SAMPLES);
-                printf("%f\n", detected_freq);
-                check_note(detected_freq);
+                adc_sample_mic();
+                dsp_fft_pre_calc(adc_buffer, SAMPLES, fft_data);
+                dsp_hann_window(fft_data, SAMPLES);
+                dsp_fft(fft_data, SAMPLES);
+                detected_freq = dsp_find_peak(fft_data, SAMPLES, FREQ_RESOLUTION);
                 current_state = check_note(detected_freq) ? TUNING : DETECTING;
-                if (current_state == DETECTING)
-                    i = -1;
+                if (current_state == DETECTING){
+                    led_index = -1;
+                    up_down = true;
+                }
+                   
                 break;
 
             case HIGH:
                 memset(message, 0, sizeof(message));
-                strcpy(message[0], "    Nota:   ");
-                strcat(message[0], note_labels[current_string.note]);
-                printf("%s\n",message[0]);
-                message[1] = "               ";
-                message[2] = "    Afrouxe a  ";
-                message[3] = "      corda    ";
+                strncpy(message[0], "    Nota: ", 12);
+                strncat(message[0] ,note_labels[current_string.note], 2);
+                strncpy(message[1], "               ", 16);
+                strncpy(message[2], "   Afrouxe a  ", 16);
+                strncpy(message[3], "     corda    ", 16);
                 print_on_oled(oled, message, 4, 6, 8);
 
-                sample_mic();
-                fft_pre_calc(adc_buffer, SAMPLES, fft_data);
-                hann_window(fft_data, SAMPLES);
-                fft(fft_data, SAMPLES);
-                detected_freq = find_peak(fft_data, SAMPLES);
-                printf("%f\n", detected_freq);
-                check_note(detected_freq);
+                adc_sample_mic();
+                dsp_fft_pre_calc(adc_buffer, SAMPLES, fft_data);
+                dsp_hann_window(fft_data, SAMPLES);
+                dsp_fft(fft_data, SAMPLES);
+                detected_freq = dsp_find_peak(fft_data, SAMPLES, FREQ_RESOLUTION);
                 current_state = check_note(detected_freq) ? TUNING : DETECTING;
-                if (current_state == DETECTING)
-                    i = -1;
-
+                if (current_state == DETECTING){
+                    led_index = -1;
+                    up_down = true;
+                }
                 break;
 
             case CORRECT:
-                message[0] = "    Nota:   ";
-                message[1] = "               ";
-                message[2] = "     Corda     ";
-                message[3] = "    Afinada!    ";
+                memset(message, 0, sizeof(message));
+                strncpy(message[0], "   Nota: ", 12);
+                strncat(message[0] ,note_labels[current_string.note], 2);
+                strncpy(message[1], "              ", 16);
+                strncpy(message[2], "    Corda     ", 16);
+                strncpy(message[3], "   Afinada!   ", 16);
                 print_on_oled(oled, message, 4, 6, 8);
                 current_state = DETECTING;  // Espera por outro sinal de áudio
-                i = - 1;
-                sleep_ms(1000);
+                led_index = - 1;
+                up_down = true;
+                timer_started = false;
+                sleep_ms(2000);
                 break;
+            case IDLE:
+                memset(message, 0, sizeof(message));
+                strncpy(message[0], "  Embarcatech  ", 16);
+                strncpy(message[1], "               ", 16);
+                strncpy(message[2], "    Afinador   ", 16);
+                strncpy(message[3], "    Digital    ", 16); 
+                print_on_oled(oled, message, 4, 5, 0);
+                sleep_ms(1000);
+                current_state = IDLE;
+                break;  
         }
        
-        if(button_pressed)
-            current_state = IDLE;
+        if(button_pressed && current_state == IDLE){
+            current_state = DETECTING;
+            led_index = -1;
+            up_down = true;
+            button_pressed = false;
+            timer_started = false;
+        }
+        sleep_ms(100);       
     }
 
     return 0;
 }
 
-void print_on_oled(uint8_t* oled, char** message, int num_of_words, int x, int y) {
+void print_on_oled(uint8_t* oled, char message[][16], int num_of_words, int x, int y) {
     memset(oled, 0, ssd1306_buffer_length);
     render_on_display(oled, &frame_area);
 
@@ -397,7 +386,7 @@ void print_on_oled(uint8_t* oled, char** message, int num_of_words, int x, int y
     render_on_display(oled, &frame_area);
 }
 
-void sample_mic() {
+void adc_sample_mic() {
     adc_fifo_drain(); // Limpa o FIFO do ADC.
     adc_run(false);   // Desliga o ADC (se estiver ligado) para configurar o DMA.
 
@@ -418,7 +407,7 @@ void sample_mic() {
     adc_run(false);
 }
 
-void fft_pre_calc(uint16_t* buffer, int size, complex_t* data){
+void dsp_fft_pre_calc(uint16_t* buffer, int size, complex_t* data){
   float conv_values[size];
 
   for (int i = 0; i < size; i++){
@@ -429,7 +418,7 @@ void fft_pre_calc(uint16_t* buffer, int size, complex_t* data){
 
 }
 
-void fft(complex_t *data, int size) {
+void dsp_fft(complex_t *data, int size) {
     if (size <= 1) return;
 
     int half = size / 2;
@@ -439,8 +428,8 @@ void fft(complex_t *data, int size) {
         odd[i]  = data[2 * i + 1];
     }
 
-    fft(even, half);
-    fft(odd, half);
+    dsp_fft(even, half);
+    dsp_fft(odd, half);
 
     for (int k = 0; k < half; k++) {
         float angle = -2 * PI * k / size;
@@ -456,7 +445,7 @@ void fft(complex_t *data, int size) {
     }
 }
 
-void hann_window(complex_t *data, int size) {
+void dsp_hann_window(complex_t *data, int size) {
     for (int i = 0; i < size; i++) {
         float w = 0.5 * (1 - cos(2 * PI * i / (size - 1)));
         data[i].r *= w;
@@ -464,22 +453,22 @@ void hann_window(complex_t *data, int size) {
     }
 }
 
-float magnitude(complex_t c) {
+float dsp_magnitude(complex_t c) {
     return sqrtf(c.r * c.r + c.i * c.i);
 }
 
-float find_peak(complex_t *data, int size) {
-    int peakIndex = 0;
-    float maxMag = 0.0f;
+float dsp_find_peak(complex_t *data, int size, float bin) {
+    int peak_index = 0;
+    float max_mag = 0.0f;
 
     for (int i = 0; i < size/2 + 1; i++) {
-        float mag = magnitude(data[i]);
-        if (mag > maxMag) {
-            maxMag = mag;
-            peakIndex = i;
+        float mag = dsp_magnitude(data[i]);
+        if (mag > max_mag) {
+            max_mag = mag;
+            peak_index = i;
         }
     }
-    return (float)(peakIndex)*FREQ_RESOLUTION;
+    return (float)(peak_index)*bin;
 }
 
 bool check_note(float frequency){
@@ -509,6 +498,13 @@ void gpio_callback(uint gpio, uint32_t events) {
             button_pressed = true;
         }
     }
+}
+
+// Callback do timer 
+static int64_t timer_callback(alarm_id_t id, void *user_data) {
+    if (current_state == DETECTING)
+        timer_expired = true;
+    return 0; // Retorna 0 para não repetir
 }
 
 void set_LED_matrix(int tune){

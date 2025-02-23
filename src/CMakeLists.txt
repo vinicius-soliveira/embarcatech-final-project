@@ -14,7 +14,8 @@ target_link_libraries(final_project
         hardware_adc
         hardware_pio
         hardware_clocks
-        )
+	hardware_sync
+)
 
 # Generate PIO header
 pico_generate_pio_header(final_project ${CMAKE_CURRENT_LIST_DIR}/../inc/ws2818b.pio)
